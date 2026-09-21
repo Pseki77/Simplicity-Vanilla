@@ -1,0 +1,239 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Simplicity Vanilla - replay recorder</title>
+<script>
+
+const u32 = (b, o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
+const u64 = (b, o) => u32(b, o) * 4294967296 + u32(b, o + 4);
+const setU32 = (b, o, v) => { b[o] = v >>> 24; b[o + 1] = (v >>> 16) & 255; b[o + 2] = (v >>> 8) & 255; b[o + 3] = v & 255; };
+const setU64 = (b, o, v) => { setU32(b, o, Math.floor(v / 4294967296)); setU32(b, o + 4, v >>> 0); };
+const fourcc = (b, o) => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
+
+
+function* boxes(b, start = 0, end = b.length) {
+  let p = start;
+  while (p + 8 <= end) {
+    let size = u32(b, p);
+    let header = 8;
+    if (size === 1) { size = u64(b, p + 8); header = 16; } else if (size === 0) size = end - p;
+    if (size < header || p + size > end) return;
+    yield { type: fourcc(b, p + 4), start: p, header, end: p + size };
+    p += size;
+  }
+}
+const child = (b, box, type) => {
+  for (const c of boxes(b, box.start + box.header, box.end)) if (c.type === type) return c;
+  return null;
+};
+const concat = (list) => {
+  const out = new Uint8Array(list.reduce((n, x) => n + x.length, 0));
+  let p = 0;
+  for (const x of list) { out.set(x, p); p += x.length; }
+  return out;
+};
+
+
+let cfg = null;
+let stream = null;
+let rec = null;
+let queue = Promise.resolve(); 
+let carry = new Uint8Array(0); 
+let pendingMoof = null;
+let initParts = [];
+let tracks = {}; 
+let videoId = 0;
+let frags = [];
+
+function parseInit(b, moov) {
+  for (const trak of boxes(b, moov.start + moov.header, moov.end)) {
+    if (trak.type !== 'trak') continue;
+    const tkhd = child(b, trak, 'tkhd');
+    const mdia = child(b, trak, 'mdia');
+    const mdhd = child(b, mdia, 'mdhd');
+    const hdlr = child(b, mdia, 'hdlr');
+    const id = u32(b, tkhd.start + 12 + (b[tkhd.start + 8] === 1 ? 16 : 8));
+    tracks[id] = u32(b, mdhd.start + 12 + (b[mdhd.start + 8] === 1 ? 16 : 8));
+    if (fourcc(b, hdlr.start + 16) === 'vide') videoId = id;
+  }
+}
+
+
+function parseMoof(b) {
+  const moof = boxes(b).next().value;
+  const trafs = [];
+  const mfhd = child(b, moof, 'mfhd');
+  for (const traf of boxes(b, moof.start + moof.header, moof.end)) {
+    if (traf.type !== 'traf') continue;
+    const t = { id: 0, tfdtOff: -1, tfdtVer: 0, base: 0, sync: null };
+    let defaultFlags = null;
+    for (const c of boxes(b, traf.start + traf.header, traf.end)) {
+      if (c.type === 'tfhd') {
+        const flags = u32(b, c.start + 8) & 0xffffff;
+        t.id = u32(b, c.start + 12);
+        let p = c.start + 16;
+        if (flags & 0x1) p += 8;
+        if (flags & 0x2) p += 4;
+        if (flags & 0x8) p += 4;
+        if (flags & 0x10) p += 4;
+        if (flags & 0x20) defaultFlags = u32(b, p);
+      } else if (c.type === 'tfdt') {
+        t.tfdtVer = b[c.start + 8];
+        t.tfdtOff = c.start + 12;
+        t.base = t.tfdtVer === 1 ? u64(b, t.tfdtOff) : u32(b, t.tfdtOff);
+      } else if (c.type === 'trun') {
+        const flags = u32(b, c.start + 8) & 0xffffff;
+        const count = u32(b, c.start + 12);
+        let p = c.start + 16;
+        if (flags & 0x1) p += 4;
+        let first = null;
+        if (flags & 0x4) first = u32(b, p);
+        else if (count > 0 && (flags & 0x400)) first = u32(b, p + ((flags & 0x100) ? 4 : 0) + ((flags & 0x200) ? 4 : 0));
+        else first = defaultFlags;
+        if (first !== null) t.sync = ((first >>> 16) & 1) === 0; 
+      }
+    }
+    trafs.push(t);
+  }
+  return { trafs, seqOff: mfhd ? mfhd.start + 12 : -1 };
+}
+
+function addFragment(bytes) {
+  const { trafs, seqOff } = parseMoof(bytes);
+  const v = trafs.find((t) => t.id === videoId) || trafs[0];
+  if (!v) return;
+  const start = v.base / (tracks[v.id] || 1);
+  frags.push({ bytes, trafs, seqOff, start, key: v.sync !== false });
+
+
+  const cutoff = start - (cfg.seconds + 3);
+  while (frags.length > 2 && frags[1].start <= cutoff) frags.shift();
+}
+
+
+function feed(chunk) {
+  carry = concat([carry, chunk]);
+  let consumed = 0;
+  for (const box of boxes(carry)) {
+    const bytes = carry.slice(box.start, box.end);
+    if (box.type === 'ftyp') initParts.push(bytes);
+    else if (box.type === 'moov') { initParts.push(bytes); parseInit(bytes, boxes(bytes).next().value); }
+    else if (box.type === 'moof') pendingMoof = bytes;
+    else if (box.type === 'mdat' && pendingMoof) { addFragment(concat([pendingMoof, bytes])); pendingMoof = null; }
+    consumed = box.end;
+  }
+  carry = carry.slice(consumed);
+}
+
+
+const MIME_TYPES = ['video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4;codecs=avc1,opus'];
+const VIDEO_ONLY = 'video/mp4;codecs=avc1';
+
+const defaultStream = (c) => navigator.mediaDevices.getDisplayMedia({
+  video: { frameRate: { ideal: c.fps, max: c.fps }, width: { max: c.maxWidth }, height: { max: c.maxHeight } },
+  audio: c.audio,
+});
+
+async function stop() {
+  if (rec) rec.ondataavailable = null; 
+  try { if (rec && rec.state !== 'inactive') rec.stop(); } catch (err) { /* already stopped */ }
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  rec = null;
+  stream = null;
+  carry = new Uint8Array(0);
+  pendingMoof = null;
+  initParts = [];
+  frags = []; 
+}
+
+async function start(config, getStream = defaultStream) {
+  await stop();
+  cfg = config;
+  queue = Promise.resolve();
+  carry = new Uint8Array(0);
+  pendingMoof = null;
+  initParts = [];
+  tracks = {};
+  videoId = 0;
+  frags = [];
+
+  stream = await getStream(cfg);
+  const hasAudio = stream.getAudioTracks().length > 0;
+  const mime = (hasAudio ? MIME_TYPES : []).concat(VIDEO_ONLY).find((m) => MediaRecorder.isTypeSupported(m));
+  if (!mime) throw new Error('MP4 recording is not supported here');
+
+  rec = new MediaRecorder(stream, {
+    mimeType: mime,
+    videoBitsPerSecond: cfg.videoBitrate,
+    audioBitsPerSecond: 128000,
+    videoKeyFrameIntervalDuration: 1000, 
+  });
+  rec.ondataavailable = (e) => {
+    queue = queue.then(async () => feed(new Uint8Array(await e.data.arrayBuffer()))).catch((err) => console.error(err));
+  };
+  rec.start(1000);
+  return { mime: rec.mimeType, hasAudio, video: stream.getVideoTracks()[0].getSettings() };
+}
+
+const isActive = () =>
+  !!rec && rec.state === 'recording' && !!stream && stream.getVideoTracks().every((t) => t.readyState === 'live');
+
+
+async function flush() {
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, 1500);
+    rec.addEventListener('dataavailable', () => { clearTimeout(timer); resolve(); }, { once: true });
+    try { rec.requestData(); } catch (err) { clearTimeout(timer); resolve(); }
+  });
+  await queue;
+}
+
+async function save() {
+  if (!isActive()) return null;
+  await flush();
+  if (!frags.length || !initParts.length) return null;
+
+ 
+  const last = frags[frags.length - 1];
+  const prev = frags[frags.length - 2];
+  const end = last.start + (prev ? last.start - prev.start : 1);
+  let from = -1;
+  for (let i = frags.length - 1; i >= 0; i--) {
+    if (frags[i].key && frags[i].start <= end - cfg.seconds) { from = i; break; }
+  }
+  if (from < 0) from = frags.findIndex((f) => f.key); 
+  if (from < 0) return null;
+  const clip = frags.slice(from);
+  const seconds = end - clip[0].start;
+
+ 
+  const origin = Math.min(...clip[0].trafs.map((t) => t.base / (tracks[t.id] || 1)));
+  const parts = clip.map((f, n) => {
+    const b = f.bytes.slice();
+    if (f.seqOff >= 0) setU32(b, f.seqOff, n + 1);
+    for (const t of f.trafs) {
+      if (t.tfdtOff < 0) continue;
+      const shifted = Math.max(0, t.base - Math.round(origin * (tracks[t.id] || 1)));
+      if (t.tfdtVer === 1) setU64(b, t.tfdtOff, shifted); else setU32(b, t.tfdtOff, shifted);
+    }
+    return b;
+  });
+
+ 
+  const init = concat(initParts);
+  for (const box of boxes(init)) {
+    if (box.type !== 'moov') continue;
+    const mvhd = child(init, box, 'mvhd');
+    const v1 = init[mvhd.start + 8] === 1;
+    const timescale = u32(init, mvhd.start + (v1 ? 28 : 20));
+    const durationOff = mvhd.start + (v1 ? 32 : 24);
+    if (v1) setU64(init, durationOff, Math.round(seconds * timescale)); else setU32(init, durationOff, Math.round(seconds * timescale));
+  }
+
+  return { bytes: concat([init, ...parts]), seconds };
+}
+
+
+const setSeconds = (seconds) => { if (cfg) cfg.seconds = seconds; };
+
+window.replay = { start, stop, save, isActive, setSeconds };
+</script>

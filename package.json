@@ -1,0 +1,17 @@
+{
+  "name": "simplicity-vanilla",
+  "productName": "Simplicity Vanilla",
+  "version": "1.0.0",
+  "description": "A tiny, dependency-free Electron client for Deadshot.io with screenshots, instant replay and a boss key",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-packager . SimplicityVanilla --platform=win32 --arch=x64 --out=dist --overwrite --no-asar",
+    "package": "npm run build"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@electron/packager": "^20.3.0",
+    "electron": "^44.4.3"
+  }
+}
