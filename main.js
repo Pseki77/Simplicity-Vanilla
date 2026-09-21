@@ -39,12 +39,12 @@ const KEY_LABELS = {
   replaySave: 'Save replay clip',
   replayToggle: 'Replay on / off',
 };
-const FPS_OPTIONS = [15, 24, 30, 45, 60];
+const FPS_OPTIONS = [15, 24, 30, 45, 60, 144, 240, 360, 500];
 const SECONDS_RANGE = [5, 120]; 
 const KEY_PATTERN = /^([a-z0-9]|F([2-9]|1[0-2]))$/; 
 
 const DEFAULTS = {
-  keys: { screenshot: '3', boss: '4', replaySave: '5', replayToggle: '6' },
+  keys: { screenshot: 'F2', boss: 'F3', replaySave: 'F4', replayToggle: 'F5' },
   switches: Object.fromEntries(SWITCHES.map(([name]) => [name, true])),
   glow: '#ff0000',
   replayFps: 30,
