@@ -2,13 +2,11 @@
 <meta charset="utf-8">
 <title>Simplicity Vanilla - replay recorder</title>
 <script>
-
 const u32 = (b, o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
 const u64 = (b, o) => u32(b, o) * 4294967296 + u32(b, o + 4);
 const setU32 = (b, o, v) => { b[o] = v >>> 24; b[o + 1] = (v >>> 16) & 255; b[o + 2] = (v >>> 8) & 255; b[o + 3] = v & 255; };
 const setU64 = (b, o, v) => { setU32(b, o, Math.floor(v / 4294967296)); setU32(b, o + 4, v >>> 0); };
 const fourcc = (b, o) => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
-
 
 function* boxes(b, start = 0, end = b.length) {
   let p = start;
@@ -32,15 +30,14 @@ const concat = (list) => {
   return out;
 };
 
-
 let cfg = null;
 let stream = null;
 let rec = null;
-let queue = Promise.resolve(); 
-let carry = new Uint8Array(0); 
+let queue = Promise.resolve();
+let carry = new Uint8Array(0);
 let pendingMoof = null;
 let initParts = [];
-let tracks = {}; 
+let tracks = {};
 let videoId = 0;
 let frags = [];
 
@@ -56,7 +53,6 @@ function parseInit(b, moov) {
     if (fourcc(b, hdlr.start + 16) === 'vide') videoId = id;
   }
 }
-
 
 function parseMoof(b) {
   const moof = boxes(b).next().value;
@@ -89,7 +85,7 @@ function parseMoof(b) {
         if (flags & 0x4) first = u32(b, p);
         else if (count > 0 && (flags & 0x400)) first = u32(b, p + ((flags & 0x100) ? 4 : 0) + ((flags & 0x200) ? 4 : 0));
         else first = defaultFlags;
-        if (first !== null) t.sync = ((first >>> 16) & 1) === 0; 
+        if (first !== null) t.sync = ((first >>> 16) & 1) === 0;
       }
     }
     trafs.push(t);
@@ -104,11 +100,9 @@ function addFragment(bytes) {
   const start = v.base / (tracks[v.id] || 1);
   frags.push({ bytes, trafs, seqOff, start, key: v.sync !== false });
 
-
   const cutoff = start - (cfg.seconds + 3);
   while (frags.length > 2 && frags[1].start <= cutoff) frags.shift();
 }
-
 
 function feed(chunk) {
   carry = concat([carry, chunk]);
@@ -124,7 +118,6 @@ function feed(chunk) {
   carry = carry.slice(consumed);
 }
 
-
 const MIME_TYPES = ['video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4;codecs=avc1,opus'];
 const VIDEO_ONLY = 'video/mp4;codecs=avc1';
 
@@ -134,18 +127,18 @@ const defaultStream = (c) => navigator.mediaDevices.getDisplayMedia({
 });
 
 async function stop() {
-  if (rec) rec.ondataavailable = null; 
-  try { if (rec && rec.state !== 'inactive') rec.stop(); } catch (err) { /* already stopped */ }
+  if (rec) rec.ondataavailable = null;
+  try { if (rec && rec.state !== 'inactive') rec.stop(); } catch (err) {}
   if (stream) stream.getTracks().forEach((t) => t.stop());
   rec = null;
   stream = null;
   carry = new Uint8Array(0);
   pendingMoof = null;
   initParts = [];
-  frags = []; 
+  frags = [];
 }
 
-async function start(config, getStream = defaultStream) {
+async function start(config) {
   await stop();
   cfg = config;
   queue = Promise.resolve();
@@ -156,7 +149,7 @@ async function start(config, getStream = defaultStream) {
   videoId = 0;
   frags = [];
 
-  stream = await getStream(cfg);
+  stream = await defaultStream(cfg);
   const hasAudio = stream.getAudioTracks().length > 0;
   const mime = (hasAudio ? MIME_TYPES : []).concat(VIDEO_ONLY).find((m) => MediaRecorder.isTypeSupported(m));
   if (!mime) throw new Error('MP4 recording is not supported here');
@@ -165,7 +158,7 @@ async function start(config, getStream = defaultStream) {
     mimeType: mime,
     videoBitsPerSecond: cfg.videoBitrate,
     audioBitsPerSecond: 128000,
-    videoKeyFrameIntervalDuration: 1000, 
+    videoKeyFrameIntervalDuration: 1000,
   });
   rec.ondataavailable = (e) => {
     queue = queue.then(async () => feed(new Uint8Array(await e.data.arrayBuffer()))).catch((err) => console.error(err));
@@ -176,7 +169,6 @@ async function start(config, getStream = defaultStream) {
 
 const isActive = () =>
   !!rec && rec.state === 'recording' && !!stream && stream.getVideoTracks().every((t) => t.readyState === 'live');
-
 
 async function flush() {
   await new Promise((resolve) => {
@@ -192,7 +184,6 @@ async function save() {
   await flush();
   if (!frags.length || !initParts.length) return null;
 
- 
   const last = frags[frags.length - 1];
   const prev = frags[frags.length - 2];
   const end = last.start + (prev ? last.start - prev.start : 1);
@@ -200,12 +191,11 @@ async function save() {
   for (let i = frags.length - 1; i >= 0; i--) {
     if (frags[i].key && frags[i].start <= end - cfg.seconds) { from = i; break; }
   }
-  if (from < 0) from = frags.findIndex((f) => f.key); 
+  if (from < 0) from = frags.findIndex((f) => f.key);
   if (from < 0) return null;
   const clip = frags.slice(from);
   const seconds = end - clip[0].start;
 
- 
   const origin = Math.min(...clip[0].trafs.map((t) => t.base / (tracks[t.id] || 1)));
   const parts = clip.map((f, n) => {
     const b = f.bytes.slice();
@@ -218,7 +208,6 @@ async function save() {
     return b;
   });
 
- 
   const init = concat(initParts);
   for (const box of boxes(init)) {
     if (box.type !== 'moov') continue;
@@ -231,7 +220,6 @@ async function save() {
 
   return { bytes: concat([init, ...parts]), seconds };
 }
-
 
 const setSeconds = (seconds) => { if (cfg) cfg.seconds = seconds; };
 
