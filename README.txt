@@ -26,3 +26,13 @@ Notes
 
  > Report any bugs/issues to Seki, Discord: pseki
 
+
+
+
+updated the code on 11/5/2026
+changed the way the notification appeared whenever clips or screenshot were saved so it does not interfere with game and capture the focus of cursor from game while playing windowed
+
+added swapping textures
+improved the settings gui, now it appears in the same window of the game instead of a new window pop up
+
+for any bugs dm `pseki` on discord
