@@ -6,7 +6,7 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "build": "electron-packager . SimplicityVanilla --platform=win32 --arch=x64 --out=dist --overwrite --no-asar",
+    "build": "electron-packager . SimplicityVanilla --platform=win32 --arch=x64 --out=dist --overwrite --no-asar --ignore=/swap && node -e \"require('fs').cpSync('swap','dist/SimplicityVanilla-win32-x64/swap',{recursive:true})\"",
     "package": "npm run build"
   },
   "license": "MIT",
