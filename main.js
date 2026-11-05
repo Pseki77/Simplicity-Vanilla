@@ -1,11 +1,8 @@
-const { app, BrowserWindow, globalShortcut, ipcMain, clipboard, ClipboardItem, Notification, nativeImage, desktopCapturer, shell } = require('electron');
+const { app, BrowserWindow, WebContentsView, session, protocol, net, globalShortcut, ipcMain, clipboard, ClipboardItem, Notification, nativeImage, desktopCapturer, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
-
 const TITLE = 'Simplicity Vanilla';
-const SETTINGS_KEY = 'F1';
-
 
 const REPLAY = {
   startOn: true,
@@ -22,31 +19,95 @@ const WATERMARK = {
   bottom: 8,
 };
 
+let mainWindow = null;
 
+const MOVE_EVENTS = ['move', 'resize', 'maximize', 'unmaximize', 'restore', 'enter-full-screen', 'leave-full-screen'];
+const htmlURL = (html) => 'data:text/html;charset=utf-8,' + encodeURIComponent(html);
 
 const SETTINGS_FILE = path.join(app.getPath('userData'), 'settings.json');
+const SWAP_DIR = path.join(app.isPackaged ? path.dirname(process.execPath) : __dirname, 'swap');
+const SWAP_FOLDERS = ['promo', 'weapons/ar2', 'weapons/awp', 'weapons/shotgun', 'weapons/vector'];
+const SWAP_TYPES = { '.webp': 'image/webp', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg' };
+const ALWAYS_SWAP = ['promo/logo.webp'];
+
+function scanSwap(dir = SWAP_DIR, base = '') {
+  const found = [];
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    return found;
+  }
+  for (const entry of entries) {
+    const rel = base ? `${base}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) found.push(...scanSwap(path.join(dir, entry.name), rel));
+    else found.push(rel);
+  }
+  return found;
+}
+
+function sniffType(data, fallback) {
+  if (data.length >= 4 && data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47) return 'image/png';
+  if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return 'image/jpeg';
+  if (data.length >= 12 && data.toString('latin1', 0, 4) === 'RIFF' && data.toString('latin1', 8, 12) === 'WEBP') return 'image/webp';
+  return fallback;
+}
+
+async function serveSwap(rel, request) {
+  const file = path.resolve(SWAP_DIR, rel);
+  if (!file.startsWith(SWAP_DIR + path.sep)) return new Response(null, { status: 403 });
+  const data = await fs.promises.readFile(file);
+  const origin = request.headers.get('origin');
+  return new Response(data, {
+    headers: {
+      'Content-Type': sniffType(data, SWAP_TYPES[path.extname(file).toLowerCase()] || 'application/octet-stream'),
+      'Access-Control-Allow-Origin': origin || '*',
+      ...(origin ? { 'Access-Control-Allow-Credentials': 'true', Vary: 'Origin' } : {}),
+      'Cross-Origin-Resource-Policy': 'cross-origin',
+      'Cache-Control': 'no-cache',
+    },
+  });
+}
+
+let swapFiles = [];
+
+async function handleHttps(request) {
+  if (swapFiles.length && request.method === 'GET') {
+    try {
+      const requested = decodeURIComponent(new URL(request.url).pathname).toLowerCase();
+      if (SWAP_TYPES[path.extname(requested)]) {
+        const match = swapFiles.find((rel) => requested.endsWith('/' + rel.toLowerCase()));
+        if (match) return await serveSwap(match, request);
+      }
+    } catch (err) {}
+  }
+  return net.fetch(request, { bypassCustomProtocolHandlers: true });
+}
 
 const SWITCHES = [
-  ['disable-gpu-vsync', 'Disable VSync'],
-  ['ignore-gpu-blocklist', 'Ignore GPU blocklist'],
-  ['enable-gpu-rasterization', 'GPU rasterization'],
-  ['enable-zero-copy', 'Zero-copy'],
-  ['force_high_performance_gpu', 'Force high-performance GPU'],
+  ['disable-frame-rate-limit', 'Uncap FPS', 'Disables the capped FPS limit'],
+  ['disable-gpu-vsync', 'Disable VSync', 'Stops syncing frames to your monitor refresh rate, lowering input lag but may cause tearing'],
+  ['ignore-gpu-blocklist', 'Ignore GPU blocklist', 'Forces GPU acceleration even on GPUs flagged as unsupported'],
+  ['enable-gpu-rasterization', 'GPU rasterization', 'Draws page graphics on the GPU instead of the CPU'],
+  ['enable-zero-copy', 'Zero-copy', 'Skips extra memory copies when sending frames to the GPU'],
+  ['force_high_performance_gpu', 'Force high-performance GPU', 'Uses your dedicated GPU instead of integrated graphics'],
 ];
 const KEY_LABELS = {
+  panel: 'Settings panel',
   screenshot: 'Screenshot',
   boss: 'Boss key',
   replaySave: 'Save replay clip',
   replayToggle: 'Replay on / off',
 };
 const FPS_OPTIONS = [15, 24, 30, 45, 60, 144, 240, 360, 500];
-const SECONDS_RANGE = [5, 120]; 
-const KEY_PATTERN = /^([a-z0-9]|F([2-9]|1[0-2]))$/; 
+const SECONDS_RANGE = [5, 120];
+const KEY_PATTERN = /^([a-z0-9]|F([1-9]|1[0-2]))$/;
 
 const DEFAULTS = {
-  keys: { screenshot: 'F2', boss: 'F3', replaySave: 'F4', replayToggle: 'F5' },
-  switches: Object.fromEntries(SWITCHES.map(([name]) => [name, true])),
+  keys: { panel: 'F1', screenshot: 'F2', boss: 'F3', replaySave: 'F4', replayToggle: 'F5' },
+  switches: Object.fromEntries(SWITCHES.map(([name]) => [name, name !== 'disable-frame-rate-limit'])),
   glow: '#ff0000',
+  customTextures: true,
   replayFps: 30,
   replaySeconds: 15,
 };
@@ -66,9 +127,10 @@ function loadSettings() {
       if (saved.switches && typeof saved.switches[name] === 'boolean') loaded.switches[name] = saved.switches[name];
     }
     if (/^#[0-9a-f]{6}$/i.test(saved.glow)) loaded.glow = saved.glow;
+    if (typeof saved.customTextures === 'boolean') loaded.customTextures = saved.customTextures;
     if (FPS_OPTIONS.includes(saved.replayFps)) loaded.replayFps = saved.replayFps;
     if (isSeconds(saved.replaySeconds)) loaded.replaySeconds = saved.replaySeconds;
-  } catch (err) { /* first run, or the file is unreadable: use the defaults */ }
+  } catch (err) {}
   return loaded;
 }
 
@@ -82,15 +144,15 @@ function saveSettings() {
 }
 
 let settings = loadSettings();
-const startupSwitches = { ...settings.switches }; 
-const restartNeeded = () => SWITCHES.some(([name]) => settings.switches[name] !== startupSwitches[name]);
+const startupSwitches = { ...settings.switches };
+const startupCustomTextures = settings.customTextures;
+const restartNeeded = () => SWITCHES.some(([name]) => settings.switches[name] !== startupSwitches[name]) || settings.customTextures !== startupCustomTextures;
 
 const settingsState = () => ({
   settings,
   restartNeeded: restartNeeded(),
   options: { keys: KEY_LABELS, fps: FPS_OPTIONS, switches: SWITCHES, seconds: SECONDS_RANGE, bitrate: REPLAY.videoBitrate },
 });
-
 
 function changeSetting(change) {
   const next = structuredClone(settings);
@@ -102,10 +164,8 @@ function changeSetting(change) {
     const [action, key] = change.key;
     if (!(action in next.keys)) {
       error = 'Unknown hotkey';
-    } else if (key === SETTINGS_KEY) {
-      error = 'F1 always opens the settings, pick another key';
     } else if (!KEY_PATTERN.test(key)) {
-      error = 'Use a letter, a number or F2 to F12';
+      error = 'Use a letter, a number or F1 to F12';
     } else {
       const clash = Object.keys(next.keys).find((a) => a !== action && next.keys[a].toLowerCase() === key.toLowerCase());
       if (clash) error = `${key.toUpperCase()} is already used for "${KEY_LABELS[clash]}"`;
@@ -114,6 +174,9 @@ function changeSetting(change) {
   } else if (change.switch) {
     const [name, enabled] = change.switch;
     if (name in next.switches && typeof enabled === 'boolean') next.switches[name] = enabled;
+    else error = 'Unknown setting';
+  } else if (change.customTextures !== undefined) {
+    if (typeof change.customTextures === 'boolean') next.customTextures = change.customTextures;
     else error = 'Unknown setting';
   } else if (change.glow !== undefined) {
     if (/^#[0-9a-f]{6}$/i.test(change.glow)) next.glow = change.glow;
@@ -133,11 +196,9 @@ function changeSetting(change) {
   return { error: null, changed: true, previous };
 }
 
-
 SWITCHES.forEach(([name]) => {
   if (settings.switches[name]) app.commandLine.appendSwitch(name);
 });
-
 
 const startTime = Date.now();
 const pad = (n) => String(n).padStart(2, '0');
@@ -147,28 +208,22 @@ function formatUptime(ms) {
   return `${Math.floor(s / 3600)}:${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)}`;
 }
 
-
 function timestamp() {
   const d = new Date();
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
 }
 
+let savedToast = null;
 
-async function copyImageToClipboard(image) {
-  if (typeof clipboard.writeImage === 'function') {
-    clipboard.writeImage(image);
-  } else {
-    await clipboard.write([new ClipboardItem({ 'image/png': new Blob([image.toPNG()], { type: 'image/png' }) })]);
+function notify(title, detail, kind, file) {
+  if (savedToast?.ready()) {
+    savedToast.show(title, detail, kind);
+    return;
   }
-}
-
-
-function notifySaved(title, file) {
-  const notification = new Notification({ title, body: file });
-  notification.on('click', () => shell.showItemInFolder(file));
+  const notification = new Notification({ title, body: file || detail });
+  if (file) notification.on('click', () => shell.showItemInFolder(file));
   notification.show();
 }
-
 
 async function addWatermark(image, scale) {
   const helper = new BrowserWindow({ show: false, webPreferences: { backgroundThrottling: false } });
@@ -192,7 +247,6 @@ async function addWatermark(image, scale) {
           const x = c.width / 2;
           const y = c.height - p.bottom * p.scale;
 
-          // neon glow (a still frame of the breathing animation)
           ctx.fillStyle = p.glow;
           ctx.shadowColor = p.glow;
           ctx.globalAlpha = 0.55;
@@ -201,7 +255,6 @@ async function addWatermark(image, scale) {
             ctx.fillText(p.text, x, y);
           }
 
-          // white core text on top
           ctx.shadowColor = 'transparent';
           ctx.shadowBlur = 0;
           ctx.globalAlpha = 0.6;
@@ -224,7 +277,7 @@ async function takeScreenshot(win) {
   if (!win.isVisible()) return;
   try {
     const raw = await win.webContents.capturePage();
-    const scale = raw.getSize().width / win.getContentBounds().width; 
+    const scale = raw.getSize().width / win.getContentBounds().width;
 
     let image = raw;
     try {
@@ -238,18 +291,18 @@ async function takeScreenshot(win) {
 
     const file = path.join(dir, `deadshot-${timestamp()}.png`);
 
-    fs.writeFileSync(file, image.toPNG());
+    const png = image.toPNG();
+    fs.writeFileSync(file, png);
     try {
-      await copyImageToClipboard(image);
+      await clipboard.write([new ClipboardItem({ 'image/png': new Blob([png], { type: 'image/png' }) })]);
     } catch (err) {
       console.error('Could not copy the screenshot to the clipboard:', err.message);
     }
-    notifySaved('Screenshot saved', file);
+    notify('Screenshot saved', path.basename(file), 'ok', file);
   } catch (err) {
     console.error('Screenshot failed:', err);
   }
 }
-
 
 function watermarkURL() {
   const { text, bottom } = WATERMARK;
@@ -268,9 +321,8 @@ function watermarkURL() {
     }
     @keyframes breathe { 0%, 100% { opacity: 0.15; } 50% { opacity: 0.9; } }
   </style></head><body><div class="wrap"><div class="t"><span class="glow">${text}</span><span class="core">${text}</span></div></div></body></html>`;
-  return 'data:text/html;charset=utf-8,' + encodeURIComponent(html);
+  return htmlURL(html);
 }
-
 
 function createWatermark(win) {
   const wm = new BrowserWindow({
@@ -281,15 +333,13 @@ function createWatermark(win) {
     transparent: true,
     hasShadow: false,
     resizable: false,
-    focusable: false, 
+    focusable: false,
     skipTaskbar: true,
     show: false,
   });
   wm.setIgnoreMouseEvents(true);
 
-  
   wm.loadURL(watermarkURL());
-
 
   const place = () => {
     if (wm.isDestroyed() || win.isDestroyed()) return;
@@ -297,26 +347,145 @@ function createWatermark(win) {
     const [w, h] = wm.getSize();
     wm.setPosition(Math.round(b.x + (b.width - w) / 2), Math.round(b.y + b.height - h));
   };
-  ['move', 'resize', 'maximize', 'unmaximize', 'restore', 'enter-full-screen', 'leave-full-screen', 'show']
-    .forEach((event) => win.on(event, place));
+  [...MOVE_EVENTS, 'show'].forEach((event) => win.on(event, place));
 
   wm.once('ready-to-show', () => {
     place();
     if (win.isVisible()) wm.showInactive();
   });
 
+  win.on('show', () => {
+    if (!wm.isDestroyed()) wm.showInactive();
+  });
+
   return wm;
 }
 
+function toastURL() {
+  const html = `<html><head><style>
+    html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; user-select: none; -webkit-user-select: none; }
+    body { padding: 12px; box-sizing: border-box; font: 14px 'Segoe UI', Arial, sans-serif; color: #f2f4f8; }
+    .card {
+      position: relative; width: 340px; height: 76px; box-sizing: border-box; overflow: hidden;
+      display: flex; align-items: center; gap: 12px; padding: 0 16px;
+      border-radius: 16px; border: 1px solid rgba(255, 255, 255, 0.28);
+      box-shadow: 0 3px 10px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.4);
+      opacity: 0; transform: translateX(-10px);
+      transition: opacity 0.22s ease, transform 0.22s ease;
+    }
+    .card.in { opacity: 1; transform: none; }
+    .bg { position: absolute; inset: 0; background-size: cover; background-position: center; filter: blur(14px) saturate(160%); transform: scale(1.2); }
+    .tint { position: absolute; inset: 0; background: linear-gradient(140deg, rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.06) 60%, rgba(255, 255, 255, 0.12)), rgba(8, 10, 16, 0.4); }
+    .icon { position: relative; flex: none; width: 34px; height: 34px; border-radius: 50%; display: flex; align-items: center; justify-content: center; border: 1px solid; }
+    .icon.ok { background: rgba(60, 220, 130, 0.22); border-color: rgba(60, 220, 130, 0.5); }
+    .icon.ok svg { stroke: #9df0bd; }
+    .icon.warn { background: rgba(255, 190, 70, 0.22); border-color: rgba(255, 190, 70, 0.5); }
+    .icon.warn svg { stroke: #ffd58a; }
+    .icon.off { background: rgba(255, 255, 255, 0.14); border-color: rgba(255, 255, 255, 0.35); }
+    .icon.off svg { stroke: #e6e9ef; }
+    .text { position: relative; min-width: 0; display: flex; flex-direction: column; }
+    .title { font-weight: 600; font-size: 14px; }
+    .detail { font-size: 12px; color: rgba(255, 255, 255, 0.65); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  </style></head><body>
+    <div class="card" id="card">
+      <div class="bg" id="bg"></div><div class="tint"></div>
+      <div class="icon ok" id="icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path id="path" d="M5 12.5l4.5 4.5L19 7.5"/></svg></div>
+      <div class="text"><span class="title" id="title"></span><span class="detail" id="detail"></span></div>
+    </div>
+    <script>
+      const card = document.getElementById('card');
+      const paths = { ok: 'M5 12.5l4.5 4.5L19 7.5', warn: 'M12 6.5v7M12 17.5v.01', off: 'M8.5 6v12M15.5 6v12' };
+      window.toast = {
+        set(d) {
+          card.classList.remove('in');
+          document.getElementById('title').textContent = d.title;
+          document.getElementById('detail').textContent = d.detail;
+          const kind = paths[d.kind] ? d.kind : 'ok';
+          document.getElementById('icon').className = 'icon ' + kind;
+          document.getElementById('path').setAttribute('d', paths[kind]);
+          document.getElementById('bg').style.backgroundImage = d.backdrop ? 'url(' + d.backdrop + ')' : 'none';
+          void card.offsetWidth;
+        },
+        play() { requestAnimationFrame(() => card.classList.add('in')); },
+        fade() { card.classList.remove('in'); },
+      };
+    </script>
+  </body></html>`;
+  return htmlURL(html);
+}
+
+function createToast(win) {
+  const CARD = { width: 340, height: 76, margin: 16, pad: 12, showMs: 3000, fadeMs: 300 };
+  const view = new BrowserWindow({
+    parent: win,
+    width: CARD.width + CARD.pad * 2,
+    height: CARD.height + CARD.pad * 2,
+    frame: false,
+    transparent: true,
+    hasShadow: false,
+    resizable: false,
+    focusable: false,
+    skipTaskbar: true,
+    show: false,
+    webPreferences: { backgroundThrottling: false },
+  });
+  view.setIgnoreMouseEvents(true);
+  const loaded = view.loadURL(toastURL());
+  loaded.catch(() => {});
+
+  let hideTimer;
+  let fadeTimer;
+
+  const place = () => {
+    if (view.isDestroyed() || win.isDestroyed()) return;
+    const b = win.getContentBounds();
+    view.setPosition(Math.round(b.x + CARD.margin - CARD.pad), Math.round(b.y + CARD.margin - CARD.pad));
+  };
+  MOVE_EVENTS.forEach((event) => win.on(event, place));
+
+  const ready = () => !view.isDestroyed() && !win.isDestroyed() && win.isVisible();
+
+  const show = async (title, detail, kind = 'ok') => {
+    if (!ready()) return;
+    let backdrop = '';
+    try {
+      const image = await win.webContents.capturePage({ x: CARD.margin, y: CARD.margin, width: CARD.width, height: CARD.height });
+      backdrop = image.toDataURL();
+    } catch (err) {}
+    try {
+      await loaded;
+      await view.webContents.executeJavaScript(`toast.set(${JSON.stringify({ title, detail, kind, backdrop })})`);
+    } catch (err) {
+      return;
+    }
+    if (!ready()) return;
+    place();
+    view.showInactive();
+    view.webContents.executeJavaScript('toast.play()').catch(() => {});
+    clearTimeout(hideTimer);
+    clearTimeout(fadeTimer);
+    hideTimer = setTimeout(() => {
+      if (view.isDestroyed()) return;
+      view.webContents.executeJavaScript('toast.fade()').catch(() => {});
+      fadeTimer = setTimeout(() => { if (!view.isDestroyed()) view.hide(); }, CARD.fadeMs);
+    }, CARD.showMs);
+  };
+
+  win.on('closed', () => {
+    clearTimeout(hideTimer);
+    clearTimeout(fadeTimer);
+  });
+
+  return { show, ready };
+}
 
 function createReplay(win) {
   const helper = new BrowserWindow({
     show: false,
     webPreferences: { partition: 'replay', backgroundThrottling: false },
   });
-  let useAudio = REPLAY.audio && process.platform === 'win32'; 
+  let useAudio = REPLAY.audio && process.platform === 'win32';
 
-  
   helper.webContents.session.setDisplayMediaRequestHandler(async (request, callback) => {
     try {
       const sources = await desktopCapturer.getSources({ types: ['window'], thumbnailSize: { width: 0, height: 0 } });
@@ -330,7 +499,7 @@ function createReplay(win) {
 
   const run = (code) => helper.webContents.executeJavaScript(code, true);
   const loaded = helper.loadFile(path.join(__dirname, 'replay.html'));
-  loaded.catch(() => {}); 
+  loaded.catch(() => {});
 
   let enabled = REPLAY.startOn;
   let recording = false;
@@ -341,18 +510,18 @@ function createReplay(win) {
 
   const stop = async () => {
     recording = false;
-    try { await run('replay.stop()'); } catch (err) { /* helper is gone */ }
+    try { await run('replay.stop()'); } catch (err) {}
   };
 
   const start = async () => {
-    if (!enabled || starting || win.isDestroyed()) return;
+    if (!enabled || starting || win.isDestroyed() || !win.isVisible()) return;
     starting = true;
     try {
       await loaded;
       for (;;) {
         try {
           const info = await run(`replay.start(${JSON.stringify({ ...REPLAY, seconds: settings.replaySeconds, fps: settings.replayFps, audio: useAudio })})`);
-          if (!enabled) { await stop(); return; } 
+          if (!enabled) { await stop(); return; }
           recording = true;
           recordingFps = Math.round(info.video.frameRate || settings.replayFps);
           lastError = '';
@@ -360,7 +529,7 @@ function createReplay(win) {
           return;
         } catch (err) {
           if (!useAudio) throw err;
-          useAudio = false; 
+          useAudio = false;
           console.error('[replay] could not capture audio, recording without it:', err.message);
         }
       }
@@ -373,19 +542,19 @@ function createReplay(win) {
     }
   };
 
-  
   const toggle = async () => {
     enabled = !enabled;
     if (enabled) await start(); else await stop();
-    new Notification({
-      title: 'Instant replay',
-      body: enabled ? `On: always keeping the last ${settings.replaySeconds} seconds` : 'Off',
-    }).show();
+    notify(
+      enabled ? 'Instant replay on' : 'Instant replay off',
+      enabled ? `Keeping the last ${settings.replaySeconds} seconds` : `Press ${settings.keys.replayToggle.toUpperCase()} to turn it back on`,
+      enabled ? 'ok' : 'off',
+    );
   };
 
   const save = async () => {
     if (!enabled) {
-      new Notification({ title: 'Instant replay is off', body: `Press ${settings.keys.replayToggle.toUpperCase()} to turn it on` }).show();
+      notify('Instant replay is off', `Press ${settings.keys.replayToggle.toUpperCase()} to turn it on`, 'off');
       return;
     }
     if (saving) return;
@@ -393,14 +562,14 @@ function createReplay(win) {
     try {
       const clip = await run('replay.save()');
       if (!clip) {
-        new Notification({ title: 'Instant replay', body: 'Nothing recorded yet, try again in a few seconds' }).show();
+        notify('Nothing recorded yet', 'Try again in a few seconds', 'warn');
         return;
       }
       const dir = path.join(app.getPath('videos'), 'Deadshot');
       fs.mkdirSync(dir, { recursive: true });
       const file = path.join(dir, `deadshot-replay-${timestamp()}.mp4`);
       fs.writeFileSync(file, Buffer.from(clip.bytes));
-      notifySaved(`Replay saved (${Math.round(clip.seconds)}s)`, file);
+      notify(`Replay saved (${Math.round(clip.seconds)}s)`, path.basename(file), 'ok', file);
     } catch (err) {
       console.error('[replay] save failed:', err.message);
     } finally {
@@ -408,15 +577,13 @@ function createReplay(win) {
     }
   };
 
-  
-  win.webContents.once('did-finish-load', start);
+  start();
   let resizeTimer;
   win.on('resize', () => {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(start, 1000);
   });
 
- 
   const watchdog = setInterval(async () => {
     if (!enabled || starting || !win.isVisible()) return;
     try { recording = await run('replay.isActive()'); } catch (err) { recording = false; }
@@ -426,24 +593,22 @@ function createReplay(win) {
   win.on('closed', () => {
     clearInterval(watchdog);
     clearTimeout(resizeTimer);
-    helper.destroy(); 
+    helper.destroy();
   });
-
 
   const restart = async () => {
     while (starting) await new Promise((resolve) => setTimeout(resolve, 200));
     await start();
   };
 
-
   const setSeconds = (seconds) => run(`replay.setSeconds(${seconds})`).catch(() => {});
 
   return { save, toggle, restart, setSeconds, isRecording: () => recording, fps: () => recordingFps };
 }
 
-
 function createSettings(win, onChange) {
-  let window = null;
+  let view = null;
+  let visible = false;
 
   ipcMain.handle('settings:get', () => settingsState());
   ipcMain.handle('settings:update', (event, change) => {
@@ -456,37 +621,56 @@ function createSettings(win, onChange) {
     app.quit();
   });
 
+  ipcMain.handle('settings:close', () => hide());
+  ipcMain.handle('settings:openSwap', () => shell.openPath(SWAP_DIR));
+
   win.on('closed', () => {
-    if (window && !window.isDestroyed()) window.destroy();
+    if (view && !view.webContents.isDestroyed()) view.webContents.close();
   });
 
-  return function open() {
-    if (window && !window.isDestroyed()) {
-      window.show();
-      window.focus();
-      return;
-    }
-    window = new BrowserWindow({
-      parent: win,
-      width: 520,
-      height: 720,
-      resizable: false,
-      minimizable: false,
-      maximizable: false,
-      title: 'Simplicity Vanilla - Settings',
+  function fit() {
+    if (!view || win.isDestroyed()) return;
+    const [width, height] = win.getContentSize();
+    view.setBounds({ x: 0, y: 0, width, height });
+  }
+  ['resize', 'maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen'].forEach((event) => win.on(event, fit));
 
+  function create() {
+    view = new WebContentsView({
       webPreferences: { nodeIntegration: true, contextIsolation: false, sandbox: false },
     });
-    window.removeMenu();
-    window.webContents.on('will-navigate', (event) => event.preventDefault());
-    window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-    window.loadFile(path.join(__dirname, 'settings.html')).catch((err) => {
+    view.setBackgroundColor('#00000000');
+    view.webContents.on('will-navigate', (event) => event.preventDefault());
+    view.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    view.webContents.loadFile(path.join(__dirname, 'settings.html')).catch((err) => {
       const message = `Could not open settings.html (it must be in the same folder as main.js): ${err.message}`;
-      window.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(`<body style="font:14px sans-serif;background:#14161a;color:#ff6b6b;padding:24px">${message}</body>`));
+      view.webContents.loadURL(htmlURL(`<body style="font:14px sans-serif;background:#14161a;color:#ff6b6b;padding:24px">${message}</body>`));
     });
-  };
-}
+  }
 
+  function show() {
+    if (!view) create();
+    win.contentView.addChildView(view);
+    fit();
+    visible = true;
+    win.webContents.executeJavaScript('document.exitPointerLock()').catch(() => {});
+    view.webContents.focus();
+    view.webContents.send('settings:shown');
+    win.webContents.capturePage().then((image) => {
+      if (!visible || view.webContents.isDestroyed()) return;
+      view.webContents.send('settings:backdrop', 'data:image/jpeg;base64,' + image.toJPEG(85).toString('base64'));
+    }).catch(() => {});
+  }
+
+  function hide() {
+    if (!visible) return;
+    visible = false;
+    win.contentView.removeChildView(view);
+    win.webContents.focus();
+  }
+
+  return () => (visible ? hide() : show());
+}
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -495,45 +679,50 @@ function createWindow() {
     icon: path.join(__dirname, '/icon.jpg'),
     title: TITLE,
     autoHideMenuBar: true,
+    backgroundColor: '#0b0d12',
     webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: false, 
+      contextIsolation: false,
     },
   });
 
-  win.on('page-title-updated', (e) => e.preventDefault()); 
+  win.on('page-title-updated', (e) => e.preventDefault());
 
-  const watermark = createWatermark(win);
-  const replay = createReplay(win);
+  mainWindow = win;
+  let watermark = null;
+  let replay = null;
+  win.webContents.once('did-finish-load', () => {
+    watermark = createWatermark(win);
+    savedToast = createToast(win);
+    replay = createReplay(win);
+  });
 
-  const openSettings = createSettings(win, (previous) => {
+  const toggleSettings = createSettings(win, (previous) => {
     if (settings.glow !== previous.glow) {
-      watermark.webContents
+      watermark?.webContents
         .executeJavaScript(`document.documentElement.style.setProperty('--glow', ${JSON.stringify(settings.glow)})`)
         .catch(() => {});
     }
-    if (settings.replayFps !== previous.replayFps) replay.restart();
-    if (settings.replaySeconds !== previous.replaySeconds) replay.setSeconds(settings.replaySeconds);
+    if (settings.customTextures !== previous.customTextures) applyRequestRules();
+    if (settings.replayFps !== previous.replayFps) replay?.restart();
+    if (settings.replaySeconds !== previous.replaySeconds) replay?.setSeconds(settings.replaySeconds);
   });
 
-  
   const updateTitle = () => {
     if (win.isDestroyed()) return;
-    const rec = replay.isRecording() ? ` | ● REC ${replay.fps()}fps` : '';
+    const rec = replay?.isRecording() ? ` | ● REC ${replay.fps()}fps` : '';
     win.setTitle(`${TITLE}${rec} | ${formatUptime(Date.now() - startTime)}`);
   };
   updateTitle();
   const titleTimer = setInterval(updateTitle, 1000);
   win.on('closed', () => clearInterval(titleTimer));
 
-  
   const setGameVisible = (visible) => {
     if (visible) {
       win.show();
-      watermark.showInactive();
+      watermark?.showInactive();
     } else {
       win.hide();
-      watermark.hide();
+      watermark?.hide();
     }
     win.webContents.setAudioMuted(!visible);
   };
@@ -550,21 +739,41 @@ function createWindow() {
     setGameVisible(false);
   };
 
-  
   const is = (input, key) => input.key.toLowerCase() === key.toLowerCase();
   win.webContents.on('before-input-event', (event, input) => {
     if (input.type !== 'keyDown' || input.isAutoRepeat || input.control || input.alt || input.meta) return;
     const { keys } = settings;
-    if (is(input, SETTINGS_KEY)) openSettings();
+    if (is(input, keys.panel)) toggleSettings();
     else if (is(input, keys.screenshot)) takeScreenshot(win);
     else if (is(input, keys.boss)) hideGame();
-    else if (is(input, keys.replaySave)) replay.save();
-    else if (is(input, keys.replayToggle)) replay.toggle();
+    else if (is(input, keys.replaySave)) replay?.save();
+    else if (is(input, keys.replayToggle)) replay?.toggle();
   });
+
+  const applyRequestRules = () => {
+    const files = scanSwap();
+    swapFiles = settings.customTextures ? files : files.filter((rel) => ALWAYS_SWAP.includes(rel.toLowerCase()));
+  };
+  applyRequestRules();
 
   win.loadURL('https://deadshot.io');
 }
 
-app.whenReady().then(createWindow);
+if (app.requestSingleInstanceLock()) {
+  app.on('second-instance', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  });
+  app.whenReady().then(() => {
+    SWAP_FOLDERS.forEach((folder) => fs.mkdirSync(path.join(SWAP_DIR, folder), { recursive: true }));
+    protocol.handle('https', handleHttps);
+    session.defaultSession.preconnect({ url: 'https://deadshot.io', numSockets: 4 });
+    createWindow();
+  });
+} else {
+  app.quit();
+}
 app.on('will-quit', () => globalShortcut.unregisterAll());
 app.on('window-all-closed', () => app.quit());
