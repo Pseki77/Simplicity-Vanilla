@@ -1,11 +1,11 @@
-Simplicity Vanilla is the cleanest version of a deadshot client that can ever be
-It offers users with a downloadable version of deadshot
+Simplicity Vanilla is the cleanest version of a Deadshot client that can ever be
+It offers users with a downloadable version of Deadshot
 
-Open the SimplicityVanilla (application) file present in this folder to run the Client 
+Open the Simplicity Vanilla (application) file present in this folder to run the Client 
 
 Simplicity Vanilla has the following features :
 
-    1. Press F2 for screenshotting while mid game (also copies the image to your clipboard). The image is  saved to the path .../pictures/deadshot.io/
+    1. Press F2 for taking a screenshot while mid game (also copies the image to your clipboard). The image is  saved to the path .../pictures/deadshot.io/
 
     2. Press F3 for immediately hiding simplicity while playing and press it again to bring the window back.
 
@@ -30,9 +30,17 @@ Notes
 
 
 updated the code on 11/5/2026
-changed the way the notification appeared whenever clips or screenshot were saved so it does not interfere with game and capture the focus of cursor from game while playing windowed
 
+changed the way the notification appeared whenever clips or screenshot were saved so it does not interfere with game and capture the focus of cursor from game while playing windowed
 added swapping textures
 improved the settings gui, now it appears in the same window of the game instead of a new window pop up
 
-for any bugs dm `pseki` on discord
+
+
+updated the code on 7/5/2026
+
+added resolution settings, offering stretched and custom resolution.
+fixed an account sign in issue (not sure if fixed entirely). Please report if faced again by anyone.
+that wraps up the update
+
+dm `pseki` on discord to report any issues.
