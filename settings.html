@@ -108,7 +108,10 @@
   .change { min-width: 78px; white-space: nowrap; }
   .change.capturing { border-color: #ffb020; color: #ffb020; }
 
-  #seconds { width: 64px; text-align: center; }
+  #seconds, #resW, #resH { width: 64px; text-align: center; }
+  #resSizes { display: flex; flex-wrap: wrap; gap: 5px; padding: 8px 0; }
+  #resSizes button { padding: 4px 7px; font-size: 13px; }
+  #resSizes button.active { background: #ff4d4d; border-color: #ff4d4d; color: #fff; }
   #hex { width: 96px; text-align: center; font-family: Consolas, monospace; }
 
   .seg { display: flex; }
@@ -180,6 +183,17 @@
   </div>
   <div id="preview">Simplicity Vanilla</div>
 
+  <h2>Resolution <small id="resHint"></small></h2>
+  <div id="resSizes"></div>
+  <div class="row">
+    <span class="text"><span>Custom resolution</span><span class="raw">Width × height in pixels</span></span>
+    <span class="ctrl"><input type="text" id="resW" maxlength="4" inputmode="numeric"><span class="hint">×</span><input type="text" id="resH" maxlength="4" inputmode="numeric"><button class="change" id="resBtn">Apply</button></span>
+  </div>
+  <label class="row">
+    <span class="text"><span>Stretch to fill the window</span><span class="raw">Ticked: the game renders at this resolution and is stretched to fill the window. Unticked: the window is resized to this resolution</span></span>
+    <input type="checkbox" id="stretchOn">
+  </label>
+
   <h2>Loading</h2>
   <label class="row">
     <span class="text"><span>Custom textures</span><span class="raw">Uses your own images from the swap folder instead of the game's, applied on launch</span></span>
@@ -241,6 +255,7 @@
       render();
       if (result.error) status(result.error, 'err');
       else if (okMessage) status(okMessage, 'ok');
+      return result;
     } catch (err) {
       status('Could not save: ' + err.message, 'err');
     }
@@ -276,6 +291,19 @@
       button.onclick = () => change({ fps: n }, `Recording at ${n} FPS`);
       return button;
     }));
+
+    const stretch = settings.stretch;
+    const [curWidth, curHeight] = state.current || [settings.windowSize.width, settings.windowSize.height];
+    const [resWidth, resHeight] = stretch.enabled ? [stretch.width, stretch.height] : [curWidth, curHeight];
+    $('resHint').textContent = stretch.enabled ? `(rendering ${resWidth} × ${resHeight}, window ${curWidth} × ${curHeight})` : `(window ${curWidth} × ${curHeight})`;
+    $('resSizes').replaceChildren(...options.resolution.presets.map(([w, h]) => {
+      const button = el('button', w === resWidth && h === resHeight ? 'active' : '', `${w}×${h}`);
+      button.onclick = () => setResolution(w, h);
+      return button;
+    }));
+    if (document.activeElement !== $('resW')) $('resW').value = resWidth;
+    if (document.activeElement !== $('resH')) $('resH').value = resHeight;
+    $('stretchOn').checked = stretch.enabled;
 
     document.documentElement.style.setProperty('--glow', settings.glow);
     $('swatches').replaceChildren(...PRESETS.map(([name, color]) => {
@@ -337,6 +365,26 @@
   }
   $('hexBtn').onclick = applyHex;
   $('hex').onkeydown = (e) => { if (e.key === 'Enter') applyHex(); };
+
+  async function setResolution(width, height) {
+    const stretching = state.settings.stretch.enabled;
+    const result = await change(stretching ? { stretch: { size: [width, height] } } : { size: [width, height] });
+    if (!result || result.error) return;
+    if (stretching) return status(`Stretching ${width} × ${height} to fill the window`, 'ok');
+    const [actualWidth, actualHeight] = state.current || [width, height];
+    if (actualWidth === width && actualHeight === height) status(`Window set to ${width} × ${height}`, 'ok');
+    else status(`Your screen only fits ${actualWidth} × ${actualHeight}, so the window was limited to that`, 'info');
+  }
+
+  function applyResolution() {
+    const width = $('resW').value.trim();
+    const height = $('resH').value.trim();
+    if (!/^\d+$/.test(width) || !/^\d+$/.test(height)) return status('Type a width and a height in pixels, like 1600 and 900', 'err');
+    setResolution(Number(width), Number(height));
+  }
+  $('resBtn').onclick = applyResolution;
+  $('resW').onkeydown = $('resH').onkeydown = (e) => { if (e.key === 'Enter') applyResolution(); };
+  $('stretchOn').onchange = () => change({ stretch: { on: $('stretchOn').checked } }, `Stretch turned ${$('stretchOn').checked ? 'on' : 'off'}`);
 
   $('restartBtn').onclick = () => api.restart();
   $('customTextures').onchange = () => change({ customTextures: $('customTextures').checked }, `Custom textures turned ${$('customTextures').checked ? 'on' : 'off'}`);
