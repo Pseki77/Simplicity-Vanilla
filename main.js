@@ -1,4 +1,4 @@
-const { app, BrowserWindow, WebContentsView, session, protocol, net, globalShortcut, ipcMain, clipboard, ClipboardItem, Notification, nativeImage, desktopCapturer, shell } = require('electron');
+const { app, BrowserWindow, WebContentsView, session, screen, globalShortcut, ipcMain, clipboard, ClipboardItem, Notification, nativeImage, desktopCapturer, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
@@ -53,35 +53,68 @@ function sniffType(data, fallback) {
   return fallback;
 }
 
-async function serveSwap(rel, request) {
-  const file = path.resolve(SWAP_DIR, rel);
-  if (!file.startsWith(SWAP_DIR + path.sep)) return new Response(null, { status: 403 });
-  const data = await fs.promises.readFile(file);
-  const origin = request.headers.get('origin');
-  return new Response(data, {
-    headers: {
-      'Content-Type': sniffType(data, SWAP_TYPES[path.extname(file).toLowerCase()] || 'application/octet-stream'),
-      'Access-Control-Allow-Origin': origin || '*',
-      ...(origin ? { 'Access-Control-Allow-Credentials': 'true', Vary: 'Origin' } : {}),
-      'Cross-Origin-Resource-Policy': 'cross-origin',
-      'Cache-Control': 'no-cache',
-    },
-  });
-}
-
 let swapFiles = [];
 
-async function handleHttps(request) {
-  if (swapFiles.length && request.method === 'GET') {
+function installSwap(win) {
+  const dbg = win.webContents.debugger;
+  const patterns = ['*.webp*', '*.png*', '*.jpg*', '*.jpeg*'].map((urlPattern) => ({ urlPattern }));
+  const sessions = new Set(['']);
+  const send = (method, params, sessionId) => dbg.sendCommand(method, params, sessionId || undefined).catch(() => {});
+  const setActive = (sessionId) => send(swapFiles.length ? 'Fetch.enable' : 'Fetch.disable', swapFiles.length ? { patterns } : {}, sessionId);
+
+  async function serve({ requestId, request }, sessionId) {
     try {
-      const requested = decodeURIComponent(new URL(request.url).pathname).toLowerCase();
-      if (SWAP_TYPES[path.extname(requested)]) {
-        const match = swapFiles.find((rel) => requested.endsWith('/' + rel.toLowerCase()));
-        if (match) return await serveSwap(match, request);
+      if (swapFiles.length && request.method === 'GET') {
+        const requested = decodeURIComponent(new URL(request.url).pathname).toLowerCase();
+        const match = SWAP_TYPES[path.extname(requested)] && swapFiles.find((rel) => requested.endsWith('/' + rel.toLowerCase()));
+        const file = match && path.resolve(SWAP_DIR, match);
+        if (file && file.startsWith(SWAP_DIR + path.sep)) {
+          const data = await fs.promises.readFile(file);
+          const origin = request.headers.Origin || request.headers.origin;
+          await dbg.sendCommand('Fetch.fulfillRequest', {
+            requestId,
+            responseCode: 200,
+            responseHeaders: [
+              { name: 'Content-Type', value: sniffType(data, SWAP_TYPES[path.extname(file).toLowerCase()]) },
+              { name: 'Access-Control-Allow-Origin', value: origin || '*' },
+              ...(origin ? [{ name: 'Access-Control-Allow-Credentials', value: 'true' }, { name: 'Vary', value: 'Origin' }] : []),
+              { name: 'Cross-Origin-Resource-Policy', value: 'cross-origin' },
+              { name: 'Cache-Control', value: 'no-cache' },
+            ],
+            body: data.toString('base64'),
+          }, sessionId || undefined);
+          return;
+        }
       }
     } catch (err) {}
+    send('Fetch.continueRequest', { requestId }, sessionId);
   }
-  return net.fetch(request, { bypassCustomProtocolHandlers: true });
+
+  dbg.on('message', async (event, method, params, sessionId) => {
+    if (method === 'Fetch.requestPaused') {
+      serve(params, sessionId);
+    } else if (method === 'Target.attachedToTarget') {
+      const child = params.sessionId;
+      sessions.add(child);
+      try {
+        await setActive(child);
+        await send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, child);
+      } finally {
+        send('Runtime.runIfWaitingForDebugger', {}, child);
+      }
+    } else if (method === 'Target.detachedFromTarget') {
+      sessions.delete(params.sessionId);
+    }
+  });
+
+  try {
+    dbg.attach('1.3');
+  } catch (err) {
+    console.error('[swap] could not start:', err.message);
+    return () => {};
+  }
+  send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
+  return () => sessions.forEach((sessionId) => setActive(sessionId));
 }
 
 const SWITCHES = [
@@ -102,6 +135,8 @@ const KEY_LABELS = {
 const FPS_OPTIONS = [15, 24, 30, 45, 60, 144, 240, 360, 500];
 const SECONDS_RANGE = [5, 120];
 const KEY_PATTERN = /^([a-z0-9]|F([1-9]|1[0-2]))$/;
+const SIZE_PRESETS = [[1280, 720], [1280, 960], [1280, 1024], [1440, 1080], [1920, 1080]];
+const SIZE_RANGE = { width: [640, 7680], height: [360, 4320] };
 
 const DEFAULTS = {
   keys: { panel: 'F1', screenshot: 'F2', boss: 'F3', replaySave: 'F4', replayToggle: 'F5' },
@@ -110,9 +145,13 @@ const DEFAULTS = {
   customTextures: true,
   replayFps: 30,
   replaySeconds: 15,
+  windowSize: { width: 1280, height: 720 },
+  stretch: { enabled: false, width: 1280, height: 960 },
 };
 
 const isSeconds = (n) => Number.isInteger(n) && n >= SECONDS_RANGE[0] && n <= SECONDS_RANGE[1];
+const inRange = (n, [min, max]) => Number.isInteger(n) && n >= min && n <= max;
+const isSize = (width, height) => inRange(width, SIZE_RANGE.width) && inRange(height, SIZE_RANGE.height);
 
 function loadSettings() {
   const loaded = structuredClone(DEFAULTS);
@@ -130,6 +169,12 @@ function loadSettings() {
     if (typeof saved.customTextures === 'boolean') loaded.customTextures = saved.customTextures;
     if (FPS_OPTIONS.includes(saved.replayFps)) loaded.replayFps = saved.replayFps;
     if (isSeconds(saved.replaySeconds)) loaded.replaySeconds = saved.replaySeconds;
+    if (saved.windowSize && isSize(saved.windowSize.width, saved.windowSize.height)) {
+      loaded.windowSize = { width: saved.windowSize.width, height: saved.windowSize.height };
+    }
+    if (saved.stretch && isSize(saved.stretch.width, saved.stretch.height)) {
+      loaded.stretch = { enabled: saved.stretch.enabled === true, width: saved.stretch.width, height: saved.stretch.height };
+    }
   } catch (err) {}
   return loaded;
 }
@@ -148,10 +193,20 @@ const startupSwitches = { ...settings.switches };
 const startupCustomTextures = settings.customTextures;
 const restartNeeded = () => SWITCHES.some(([name]) => settings.switches[name] !== startupSwitches[name]) || settings.customTextures !== startupCustomTextures;
 
+const currentSize = () => (mainWindow && !mainWindow.isDestroyed() ? mainWindow.getContentSize() : null);
+
 const settingsState = () => ({
   settings,
   restartNeeded: restartNeeded(),
-  options: { keys: KEY_LABELS, fps: FPS_OPTIONS, switches: SWITCHES, seconds: SECONDS_RANGE, bitrate: REPLAY.videoBitrate },
+  current: currentSize(),
+  options: {
+    keys: KEY_LABELS,
+    fps: FPS_OPTIONS,
+    switches: SWITCHES,
+    seconds: SECONDS_RANGE,
+    bitrate: REPLAY.videoBitrate,
+    resolution: { presets: SIZE_PRESETS, ...SIZE_RANGE },
+  },
 });
 
 function changeSetting(change) {
@@ -187,6 +242,18 @@ function changeSetting(change) {
   } else if (change.seconds !== undefined) {
     if (isSeconds(change.seconds)) next.replaySeconds = change.seconds;
     else error = `Enter a whole number from ${SECONDS_RANGE[0]} to ${SECONDS_RANGE[1]}`;
+  } else if (change.size !== undefined) {
+    const [width, height] = Array.isArray(change.size) ? change.size : [];
+    if (isSize(width, height)) next.windowSize = { width, height };
+    else error = `Use a width of ${SIZE_RANGE.width.join(' to ')} and a height of ${SIZE_RANGE.height.join(' to ')}`;
+  } else if (change.stretch !== undefined) {
+    const { on, size } = change.stretch || {};
+    const [width, height] = size === undefined ? [next.stretch.width, next.stretch.height] : Array.isArray(size) ? size : [];
+    if ((on !== undefined && typeof on !== 'boolean') || !isSize(width, height)) {
+      error = `Use a width of ${SIZE_RANGE.width.join(' to ')} and a height of ${SIZE_RANGE.height.join(' to ')}`;
+    } else {
+      next.stretch = { enabled: on === undefined ? next.stretch.enabled : on, width, height };
+    }
   }
 
   if (error) return { error, changed: false };
@@ -611,9 +678,10 @@ function createSettings(win, onChange) {
   let visible = false;
 
   ipcMain.handle('settings:get', () => settingsState());
-  ipcMain.handle('settings:update', (event, change) => {
+  ipcMain.handle('settings:update', async (event, change) => {
     const result = changeSetting(change);
-    if (result.changed) onChange(result.previous);
+    if (result.changed) onChange(result.previous, change);
+    if (change.size || change.reset) await new Promise((resolve) => setTimeout(resolve, 150));
     return { error: result.error, state: settingsState() };
   });
   ipcMain.handle('settings:restart', () => {
@@ -648,6 +716,20 @@ function createSettings(win, onChange) {
     });
   }
 
+  function sendBackdrop() {
+    win.webContents.capturePage().then((image) => {
+      if (!visible || view.webContents.isDestroyed()) return;
+      view.webContents.send('settings:backdrop', 'data:image/jpeg;base64,' + image.toJPEG(85).toString('base64'));
+    }).catch(() => {});
+  }
+
+  let backdropTimer;
+  win.on('resize', () => {
+    if (!visible) return;
+    clearTimeout(backdropTimer);
+    backdropTimer = setTimeout(sendBackdrop, 250);
+  });
+
   function show() {
     if (!view) create();
     win.contentView.addChildView(view);
@@ -656,10 +738,7 @@ function createSettings(win, onChange) {
     win.webContents.executeJavaScript('document.exitPointerLock()').catch(() => {});
     view.webContents.focus();
     view.webContents.send('settings:shown');
-    win.webContents.capturePage().then((image) => {
-      if (!visible || view.webContents.isDestroyed()) return;
-      view.webContents.send('settings:backdrop', 'data:image/jpeg;base64,' + image.toJPEG(85).toString('base64'));
-    }).catch(() => {});
+    sendBackdrop();
   }
 
   function hide() {
@@ -674,18 +753,65 @@ function createSettings(win, onChange) {
 
 function createWindow() {
   const win = new BrowserWindow({
-    width: 1280,
-    height: 720,
+    width: settings.windowSize.width,
+    height: settings.windowSize.height,
+    useContentSize: true,
     icon: path.join(__dirname, '/icon.jpg'),
     title: TITLE,
     autoHideMenuBar: true,
     backgroundColor: '#0b0d12',
     webPreferences: {
       contextIsolation: false,
+      preload: path.join(__dirname, 'preload.js'),
     },
   });
 
   win.on('page-title-updated', (e) => e.preventDefault());
+
+  const applyWindowSize = () => {
+    if (win.isFullScreen()) win.setFullScreen(false);
+    if (win.isMaximized()) win.unmaximize();
+    win.setContentSize(settings.windowSize.width, settings.windowSize.height);
+    win.center();
+    const area = screen.getDisplayMatching(win.getBounds()).workArea;
+    const b = win.getBounds();
+    const width = Math.min(b.width, area.width);
+    const height = Math.min(b.height, area.height);
+    win.setBounds({
+      x: Math.min(Math.max(b.x, area.x), area.x + area.width - width),
+      y: Math.min(Math.max(b.y, area.y), area.y + area.height - height),
+      width,
+      height,
+    });
+  };
+  applyWindowSize();
+
+  const stretchPayload = () => {
+    const [realWidth, realHeight] = win.getContentSize();
+    return { ...settings.stretch, realWidth, realHeight };
+  };
+  const pushStretch = () => {
+    if (!win.isDestroyed()) win.webContents.send('stretch:update', stretchPayload());
+  };
+  ipcMain.on('stretch:get', (event) => {
+    event.returnValue = stretchPayload();
+  });
+  win.on('resize', pushStretch);
+
+  let sizeTimer;
+  win.on('resize', () => {
+    clearTimeout(sizeTimer);
+    sizeTimer = setTimeout(() => {
+      if (win.isDestroyed() || win.isFullScreen() || win.isMaximized()) return;
+      const [width, height] = win.getContentSize();
+      const saved = settings.windowSize;
+      if (isSize(width, height) && (width !== saved.width || height !== saved.height)) {
+        settings = { ...settings, windowSize: { width, height } };
+        saveSettings();
+      }
+    }, 600);
+  });
+  win.on('closed', () => clearTimeout(sizeTimer));
 
   mainWindow = win;
   let watermark = null;
@@ -696,7 +822,7 @@ function createWindow() {
     replay = createReplay(win);
   });
 
-  const toggleSettings = createSettings(win, (previous) => {
+  const toggleSettings = createSettings(win, (previous, change) => {
     if (settings.glow !== previous.glow) {
       watermark?.webContents
         .executeJavaScript(`document.documentElement.style.setProperty('--glow', ${JSON.stringify(settings.glow)})`)
@@ -705,6 +831,9 @@ function createWindow() {
     if (settings.customTextures !== previous.customTextures) applyRequestRules();
     if (settings.replayFps !== previous.replayFps) replay?.restart();
     if (settings.replaySeconds !== previous.replaySeconds) replay?.setSeconds(settings.replaySeconds);
+    const sizeChanged = settings.windowSize.width !== previous.windowSize.width || settings.windowSize.height !== previous.windowSize.height;
+    if (change.size || (change.reset && sizeChanged)) applyWindowSize();
+    if (change.stretch || change.reset) pushStretch();
   });
 
   const updateTitle = () => {
@@ -750,9 +879,11 @@ function createWindow() {
     else if (is(input, keys.replayToggle)) replay?.toggle();
   });
 
+  const refreshSwap = installSwap(win);
   const applyRequestRules = () => {
     const files = scanSwap();
     swapFiles = settings.customTextures ? files : files.filter((rel) => ALWAYS_SWAP.includes(rel.toLowerCase()));
+    refreshSwap();
   };
   applyRequestRules();
 
@@ -768,7 +899,6 @@ if (app.requestSingleInstanceLock()) {
   });
   app.whenReady().then(() => {
     SWAP_FOLDERS.forEach((folder) => fs.mkdirSync(path.join(SWAP_DIR, folder), { recursive: true }));
-    protocol.handle('https', handleHttps);
     session.defaultSession.preconnect({ url: 'https://deadshot.io', numSockets: 4 });
     createWindow();
   });
